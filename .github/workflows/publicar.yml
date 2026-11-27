@@ -1,0 +1,307 @@
+# Arma, prueba y publica el instalador de HubAI desde este repo PÚBLICO (Actions gratis),
+# con el código del repo privado tobiaspampinella/centro-de-mando.
+#
+# Cada 30 minutos (o a mano desde «Run workflow») mira la "version" de package.json en
+# main del repo privado. Si esa versión todavía no está publicada acá, corre los recorridos
+# críticos con la app real, arma el instalador en Windows, lo prueba (instalación encima de
+# la versión anterior, arranque, fusibles, desinstalación) y lo publica. La app instalada se
+# actualiza desde las Releases de este repo.
+#
+# Seguridad (el repo es público, los registros se ven):
+# - Solo corre por horario o a mano: nunca por pull requests de terceros.
+# - SOURCE_TOKEN: token de GitHub de grano fino con permiso «Contents: Read-only» SOLO sobre
+#   centro-de-mando. Se usa únicamente en los pasos de checkout, sin quedar guardado en git.
+# - «armar» y «e2e» corren el código de terceros (npm) sin permiso de escritura.
+#   «publicar» tiene permiso de escritura pero no corre código npm.
+name: Publicar versión
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Rama o commit de centro-de-mando a publicar'
+        required: false
+        default: main
+
+permissions: {}
+
+concurrency:
+  group: publicar
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: tobiaspampinella/centro-de-mando
+  SOURCE_REF: ${{ inputs.ref || 'main' }}
+
+jobs:
+  # ¿Hay una versión nueva para publicar? Si no, todo lo demás se saltea (corrida de segundos).
+  revisar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      skip: ${{ steps.check.outputs.skip }}
+      tag: ${{ steps.check.outputs.tag }}
+      sha: ${{ steps.check.outputs.sha }}
+    steps:
+      - name: ¿Está el token del código?
+        env:
+          SOURCE_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+        run: |
+          if [ -z "$SOURCE_TOKEN" ]; then
+            echo "::error::Falta el secreto SOURCE_TOKEN (token de solo lectura sobre centro-de-mando). Ver README."
+            exit 1
+          fi
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SOURCE_REF }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+          sparse-checkout: package.json
+          sparse-checkout-cone-mode: false
+      - name: ¿Esta versión ya está publicada?
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v="v$(node -p "require('./package.json').version")"
+          echo "tag=$v" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          pub="$(gh release view "$v" --repo "$GITHUB_REPOSITORY" --json assets,isDraft --jq '[.isDraft, (.assets|map(.name)|join(","))]|@tsv' 2>/dev/null || true)"
+          if [[ "$pub" == false*latest.yml* ]]; then
+            echo "La versión $v ya está publicada: no hay nada que hacer."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Versión nueva para publicar: $v ($(git rev-parse --short HEAD))"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Recorridos críticos con la app real: si fallan, no se publica.
+  e2e:
+    needs: revisar
+    if: needs.revisar.outputs.skip == 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.revisar.outputs.sha }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      - name: Bibliotecas de Electron y xvfb
+        run: |
+          sudo apt-get update
+          pkgs="xvfb libnss3 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libxshmfence1"
+          for p in libatk1.0-0 libatk-bridge2.0-0 libcups2 libgtk-3-0 libasound2; do
+            if apt-cache show "${p}t64" >/dev/null 2>&1; then pkgs="$pkgs ${p}t64"; else pkgs="$pkgs $p"; fi
+          done
+          sudo apt-get install -y $pkgs
+      - run: npm ci
+      - run: npm test
+      - run: PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm install --no-save --no-package-lock playwright@1.63.0
+      - run: node node_modules/electron/install.js
+      - name: Recorridos críticos (bienvenida, modelo elegido, chat, armazón, Directo, auditoría de interfaz, panel)
+        env:
+          UI_SIZES: 1120x760
+          HUBAI_API_URL: 'off'
+        run: |
+          for t in setup model-lock chat-real ui-shell directo-seguro ui-audit ui-panel; do
+            echo "::group::$t"
+            xvfb-run -a -s "-screen 0 1600x1200x24" node "test/e2e/$t.js"
+            echo "::endgroup::"
+          done
+      - name: Rendimiento (presupuesto)
+        env:
+          HUBAI_API_URL: 'off'
+          PERF_BUDGET: '1'
+          PERF_IDLE_MS: '15000'
+        run: xvfb-run -a -s "-screen 0 1600x1200x24" node test/e2e/perf.js
+
+  armar:
+    needs: revisar
+    if: needs.revisar.outputs.skip == 'false'
+    runs-on: windows-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.revisar.outputs.sha }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      - name: ¿La clave pública de derechos coincide con la del servidor?
+        shell: bash
+        run: |
+          API=$(node -p 'require("./package.json").hubai?.apiUrl || ""')
+          APP=$(node -p 'require("./package.json").hubai?.entitlementPublicKey || ""')
+          if [ -z "$API" ]; then echo "Sin servidor configurado: nada que comparar."; exit 0; fi
+          SRV=$(curl -sS -m 20 "$API/v1/entitlement/public-key" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(JSON.parse(s).publicKey||"")}catch{}})' || true)
+          if [ -z "$SRV" ]; then echo "::warning::El servidor no informó su clave pública."; exit 0; fi
+          if [ "$SRV" != "$APP" ]; then echo "::error::package.json › hubai.entitlementPublicKey no coincide con la del servidor ($SRV)."; exit 1; fi
+          echo "Coincide."
+      # Sin scripts de instalación: ninguna dependencia corre código al instalarse.
+      - shell: bash
+        run: npm ci --ignore-scripts
+      - run: npm test
+      - name: Cargar el cliente OAuth de Google
+        shell: bash
+        env:
+          HUBAI_GOOGLE_CLIENT_ID: ${{ secrets.HUBAI_GOOGLE_CLIENT_ID }}
+          HUBAI_GOOGLE_CLIENT_SECRET: ${{ secrets.HUBAI_GOOGLE_CLIENT_SECRET }}
+        run: |
+          node -e "const fs=require('fs');const p=JSON.parse(fs.readFileSync('package.json','utf8'));p.hubai.oauth={google:{clientId:process.env.HUBAI_GOOGLE_CLIENT_ID||'',clientSecret:process.env.HUBAI_GOOGLE_CLIENT_SECRET||''}};fs.writeFileSync('package.json',JSON.stringify(p,null,2)+'\n')"
+      - name: Armar el instalador (sin publicar)
+        run: npx electron-builder --win nsis --x64 --publish never
+      # La versión nueva tiene que instalarse ENCIMA de la publicada: una sola entrada en
+      # «Aplicaciones instaladas», misma carpeta, sin la entrada fantasma del identificador viejo.
+      - name: Probar la actualización sobre la versión anterior
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $prev = gh release list --repo $env:GITHUB_REPOSITORY --exclude-drafts --limit 1 --json tagName --jq '.[0].tagName'
+          if (-not $prev) { 'No hay versión anterior publicada: no hay nada que probar.'; exit 0 }
+          New-Item -ItemType Directory -Force prev | Out-Null
+          gh release download $prev --repo $env:GITHUB_REPOSITORY --pattern '*-setup.exe' --dir prev --clobber
+          $old = Get-ChildItem prev -Filter '*-setup.exe' | Select-Object -First 1
+          "Instalo la anterior: $($old.Name)"
+          Start-Process $old.FullName -ArgumentList '/S' -Wait
+          Start-Sleep 3
+          Get-Process 'HubAI','Centro de Mando' -ErrorAction SilentlyContinue | Stop-Process -Force
+          $ghost = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\33c96945-3669-5206-a0e3-4aef30386726'
+          New-Item -Force $ghost | Out-Null
+          Set-ItemProperty $ghost DisplayName 'Centro de Mando 0.9.1'
+          $new = Get-ChildItem dist -Filter '*-setup.exe' | Select-Object -First 1
+          "Instalo encima: $($new.Name)"
+          Start-Process $new.FullName -ArgumentList '/S','--updated' -Wait
+          Start-Sleep 3
+          Get-Process 'HubAI','Centro de Mando' -ErrorAction SilentlyContinue | Stop-Process -Force
+          $entries = Get-ChildItem 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall' |
+            ForEach-Object { Get-ItemProperty $_.PSPath } |
+            Where-Object { $_.DisplayName -match 'HubAI|Centro de Mando' }
+          $entries | Select-Object PSChildName, DisplayName, DisplayVersion, InstallLocation | Format-Table | Out-Host
+          if (@($entries).Count -ne 1) { throw "Tiene que quedar UNA sola entrada instalada y hay $(@($entries).Count)" }
+          if ($entries.DisplayName -ne 'HubAI') { throw "La entrada se llama '$($entries.DisplayName)' y no 'HubAI'" }
+          $dir = (Get-ItemProperty 'HKCU:\Software\d3f47ad1-7544-5956-ad98-565c58d2786a').InstallLocation
+          if (-not (Test-Path (Join-Path $dir 'HubAI.exe'))) { throw "No está HubAI.exe en $dir" }
+          if (Test-Path (Join-Path $dir 'Centro de Mando.exe')) { throw 'Quedó el ejecutable con el nombre viejo' }
+          "Actualización encima de ${prev}: OK (una sola entrada, ${dir})"
+          $un = Get-ChildItem $dir -Filter 'Uninstall*.exe' | Select-Object -First 1
+          Start-Process $un.FullName -ArgumentList '/S' -Wait
+          Start-Sleep 5
+      - name: Probar la instalación en Windows
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $setup = Get-ChildItem dist -Filter '*-setup.exe' | Select-Object -First 1
+          "Instalador: $($setup.Name) ($([math]::Round($setup.Length/1MB,1)) MB)"
+          "SHA-256: $((Get-FileHash $setup.FullName -Algorithm SHA256).Hash)"
+          "Firma digital: $((Get-AuthenticodeSignature $setup.FullName).Status) (sin certificado: Windows muestra SmartScreen)"
+          try {
+            & "$env:ProgramFiles\Windows Defender\MpCmdRun.exe" -Scan -ScanType 3 -File $setup.FullName -DisableRemediation | Out-Host
+          } catch { "Antivirus de Windows no disponible en esta máquina: $_" }
+          Start-Process $setup.FullName -ArgumentList '/S' -Wait
+          Start-Sleep 3
+          Get-Process 'HubAI','Centro de Mando' -ErrorAction SilentlyContinue | Stop-Process -Force
+          $app = Get-ChildItem "$env:LOCALAPPDATA\Programs" -Recurse -Depth 2 -Filter 'HubAI.exe' | Select-Object -First 1
+          if (-not $app) { throw 'No se instaló en %LOCALAPPDATA%\Programs' }
+          "Instalada en: $($app.DirectoryName) (por usuario, sin permisos de administrador)"
+          $fuses = npx --no-install electron-fuses read --app $app.FullName | Out-String
+          $fuses | Out-Host
+          foreach ($f in 'RunAsNode is Disabled','EnableNodeOptionsEnvironmentVariable is Disabled','EnableNodeCliInspectArguments is Disabled','EnableEmbeddedAsarIntegrityValidation is Enabled','OnlyLoadAppFromAsar is Enabled') {
+            if ($fuses -notmatch [regex]::Escape($f)) { throw "Fusible mal configurado: falta '$f'" }
+          }
+          $smoke = Join-Path $env:TEMP 'cdm-smoke.json'
+          Remove-Item $smoke -ErrorAction SilentlyContinue
+          $env:CDM_SMOKE_FILE = $smoke
+          $p = Start-Process $app.FullName -PassThru
+          $p | Wait-Process -Timeout 90 -ErrorAction SilentlyContinue
+          if (-not $p.HasExited) { $p | Stop-Process -Force; throw 'La app no terminó la prueba de arranque' }
+          if (-not (Test-Path $smoke)) { throw "La app no escribió el resultado (código $($p.ExitCode))" }
+          $r = Get-Content $smoke -Raw | ConvertFrom-Json
+          Get-Content $smoke -Raw | Out-Host
+          if (-not $r.ok) { throw 'La prueba de arranque falló: ventanas sin cargar, sin aislamiento o con errores' }
+          "Versión instalada: $($r.version) · ventanas: $(($r.loaded.PSObject.Properties.Name) -join ', ')"
+          $un = Get-ChildItem $app.DirectoryName -Filter 'Uninstall*.exe' | Select-Object -First 1
+          Start-Process $un.FullName -ArgumentList '/S' -Wait
+          Start-Sleep 5
+          if (Test-Path $app.FullName) { throw 'La desinstalación dejó la app' }
+          'Instalación, arranque y desinstalación: OK'
+      - name: Juntar los archivos para publicar
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force release-out | Out-Null
+          Copy-Item dist/*-setup.exe, dist/*-setup.exe.blockmap, dist/latest.yml release-out/
+          Copy-Item src/release-notes.json release-out/
+          Get-ChildItem release-out | Format-Table Name, Length | Out-Host
+      - name: Guardar los archivos para publicar
+        uses: actions/cache/save@v4
+        with:
+          path: release-out
+          key: instalador-${{ github.run_id }}-${{ github.run_attempt }}
+          enableCrossOsArchive: true
+
+  publicar:
+    needs: [revisar, e2e, armar]
+    if: needs.revisar.outputs.skip == 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/cache/restore@v4
+        with:
+          path: release-out
+          key: instalador-${{ github.run_id }}-${{ github.run_attempt }}
+          enableCrossOsArchive: true
+          fail-on-cache-miss: true
+      - name: Publicar (borrador → archivos → publicado)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.revisar.outputs.tag }}
+          SHA: ${{ needs.revisar.outputs.sha }}
+        run: |
+          cd release-out
+          ls -la
+          ls *-setup.exe *-setup.exe.blockmap latest.yml > /dev/null
+          # Borradores de un intento fallido y versión a medias: se borran y se rehace.
+          for id in $(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '.[] | select(.draft) | .id'); do
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/$id" > /dev/null || true
+          done
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes
+          fi
+          sum="$(sha256sum *-setup.exe | cut -d' ' -f1)"
+          node -e '
+            const v = process.argv[1]; const n = require("./release-notes.json")[v] || {};
+            const lines = [];
+            if (n.title) lines.push("### " + n.title, "");
+            if ((n.features || []).length) lines.push("## Novedades", ...n.features.map((f) => "- " + f), "");
+            lines.push("Instalá HubAI-" + v + "-setup.exe. Si ya tenés la app instalada, se actualiza sola.", "", "SHA-256: " + process.argv[2], "", "Código: centro-de-mando@" + process.argv[3].slice(0, 7));
+            require("fs").writeFileSync("release-body.md", lines.join("\n"));
+          ' "${TAG#v}" "$sum" "$SHA"
+          gh release create "$TAG" *-setup.exe *-setup.exe.blockmap latest.yml \
+            --repo "$GITHUB_REPOSITORY" --draft \
+            --title "HubAI ${TAG#v}" \
+            --notes-file release-body.md
+          names="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets|map(.name)|join(",")')"
+          [[ "$names" == *latest.yml* && "$names" == *setup.exe* ]] || { echo "Falta el instalador o latest.yml: no publico."; exit 1; }
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          echo "Publicada $TAG (SHA-256 $sum)."
